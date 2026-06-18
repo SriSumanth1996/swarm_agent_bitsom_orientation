@@ -2594,9 +2594,8 @@ def markdown_block_to_html(text: str) -> str:
         if stripped.startswith("- "):
             bullet_items.append(f"<li>{html.escape(stripped[2:])}</li>")
         elif re.match(r"^\d+\.\s", stripped):
-            numbered_items.append(
-                f"<li>{html.escape(re.sub(r'^\d+\.\s*', '', stripped))}</li>"
-            )
+            cleaned = re.sub(r"^\d+\.\s*", "", stripped)
+            numbered_items.append(f"<li>{html.escape(cleaned)}</li>")
         else:
             bold_match = re.match(r"^\*\*(.+?)\*\*(?:\s+(.*))?$", stripped)
             if bold_match:
