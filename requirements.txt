@@ -1,0 +1,7 @@
+openai
+pandas
+streamlit
+trafilatura
+beautifulsoup4
+playwright
+requests
