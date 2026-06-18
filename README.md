@@ -25,9 +25,7 @@ The app is useful for exploring situations where multiple stakeholders have diff
 
 ## Project Context
 
-Scenario Swarm was created for BITSoM-related use and includes BITSoM-specific branding in the current interface.
-
-The source code is licensed under the MIT License, but BITSoM names, logos, visual identity, and institutional branding elements are not granted for reuse through this repository.
+Scenario Swarm was created for classroom and tutoring use at BITSoM.
 
 ---
 
