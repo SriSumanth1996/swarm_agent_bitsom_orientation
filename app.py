@@ -162,7 +162,7 @@ html, body, .stApp, [class*="css"] {
   background: var(--bg);
 }
 
-.stMarkdown, .stMarkdown p, .stText, p, li, td, th, div, span, label, input, select, textarea, button {
+.stMarkdown, .stMarkdown p, .stText, p, li, td, th, label, input, select, textarea, button {
   font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif !important;
 }
 
@@ -1516,8 +1516,18 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
 
 .material-icons,
 .material-symbols-outlined,
-.material-symbols-rounded {
+.material-symbols-rounded,
+span[data-testid="stIconMaterial"],
+[data-testid="stExpander"] .material-symbols-rounded,
+[data-testid="stExpander"] .material-icons,
+[data-testid="stExpander"] .material-symbols-outlined,
+[data-testid="stSelectbox"] .material-symbols-rounded,
+[data-testid="stSelectbox"] .material-icons,
+[data-testid="stSelectbox"] .material-symbols-outlined {
   font-family: "Material Symbols Rounded", "Material Icons" !important;
+  font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24 !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
 }
 
 .main .stMarkdown h1 {
