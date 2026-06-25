@@ -1,7 +1,8 @@
-openai
-pandas
-streamlit
-trafilatura
-beautifulsoup4
-playwright
-requests
+streamlit>=1.28.0
+openai>=1.30.0
+pandas>=2.0.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+trafilatura>=1.6.0
+lxml>=4.9.0
+charset-normalizer>=3.3.0
