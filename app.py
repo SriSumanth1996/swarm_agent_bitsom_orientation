@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import datetime
 import html
+import json
+import os
 import re
 import time
+import urllib.parse
+import urllib.request
+from collections.abc import Callable, Iterator
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
@@ -20,11 +26,71 @@ POSITION_LABEL = "POSITION / FOCUSING POINT"
 
 DEFAULT_AGENT_TEMPERATURE = 0.45
 
-MAX_SUPPORTING_URLS_PER_AGENT = 3
+MAX_TOOL_URLS_PER_AGENT = 3
+MAX_TOOL_CALLS_PER_TURN = 3
+WEB_SEARCH_TOOL_NAME = "web_search"
 MIN_EXTRACTED_CHARS = 300
 MAX_CHARS_PER_ARTICLE = 5000
 MAX_PROMPT_CONTEXT_CHARS = 2500
+MAX_WEB_SEARCH_EXCERPT_CHARS = 280
 ARTICLE_REQUEST_TIMEOUT = 12
+PLAYWRIGHT_TIMEOUT_SEC = 30
+WAYBACK_TIMEOUT_SEC = 20
+WAYBACK_AVAILABILITY_API = (
+    "https://archive.org/wayback/available?url={url}&timestamp={ts}"
+)
+WEB_FETCH_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+PLAYWRIGHT_STEALTH_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+if (window.chrome) {
+    window.chrome.runtime = {connect: function() {}, sendMessage: function() {}};
+}
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+"""
+PLAYWRIGHT_LAUNCH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-infobars",
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--no-first-run",
+    "--lang=en-US",
+]
+BLOCKED_PAGE_TITLES = {
+    "access denied",
+    "forbidden",
+    "403 forbidden",
+    "403",
+    "blocked",
+    "attention required",
+    "just a moment",
+    "checking your browser",
+    "verify you are human",
+}
+BOT_BLOCK_HTTP_CODES = frozenset({401, 403, 429, 503})
+BLOCKED_FETCH_NOTICE = (
+    "Normal fetch is blocked. Crawling in silently — crossing the bots…"
+)
+WAYBACK_FETCH_NOTICE = (
+    "Still blocked. Digging deeper for a readable copy of the source…"
+)
+WEB_SEARCH_RECOVERED_NOTICE = (
+    "Normal fetch was blocked. We crawled in silently, crossed the bots, and recovered the source."
+)
+
+DEBATE_AGENT_SYSTEM = (
+    "You are simulating one stakeholder in a business-school classroom debate. "
+    "Follow the requested output format exactly. "
+    "When web_search is available, call it only when you need specific evidence, facts, "
+    "or examples from one of the agent's registered URLs. "
+    "Do not call tools if your position and the debate history are enough. "
+    "Do not invent facts beyond your position, the scenario, debate history, "
+    "and text returned by web_search."
+)
 
 REASONING_STYLE_DEFINITIONS = {
     "Balanced": "Weighs both sides and keeps the argument measured.",
@@ -49,7 +115,8 @@ REASONING_STYLES = list(REASONING_STYLE_DEFINITIONS.keys())
 DEFAULT_GENERAL_DEBATE_RULES = (
     "Agents must stay in character, disagree meaningfully, avoid final verdicts, "
     "respond to the strongest points made by others, never repeat their own prior "
-    "arguments verbatim, call out when another participant recycles the same point, "
+    "arguments verbatim, call out when another participant recycles the same point "
+    "and name the round number where that point was first raised, "
     "and if repetition was already challenged in an earlier round, reference that "
     "prior call-out instead of treating it as a new issue."
 )
@@ -690,6 +757,80 @@ div[data-testid="stSidebar"] .sidebar-step-inner {
   font-size: 0.88rem;
   color: var(--text);
   line-height: 1.6;
+}
+
+.debate-web-search-calls {
+  margin-bottom: 10px;
+}
+
+.debate-web-search-call {
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(201, 151, 58, 0.35);
+  background: rgba(255, 253, 248, 0.95);
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+
+.debate-web-search-call--failed {
+  border-color: rgba(180, 60, 60, 0.35);
+  background: rgba(255, 245, 245, 0.95);
+}
+
+.debate-web-search-call--retrying {
+  border-color: rgba(22, 47, 86, 0.35);
+  background: rgba(234, 240, 248, 0.95);
+}
+
+.debate-web-search-blocked {
+  margin: 6px 0 4px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--navy-mid);
+  color: var(--navy);
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.65);
+}
+
+.debate-web-search-method {
+  margin-top: 4px;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.debate-web-search-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--gold-dark);
+  margin-bottom: 4px;
+}
+
+.debate-web-search-reason {
+  color: var(--navy);
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.debate-web-search-url a {
+  color: var(--navy-mid);
+  word-break: break-all;
+}
+
+.debate-web-search-title {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.debate-web-search-excerpt {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--gold);
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.7);
 }
 
 .debate-turn-text strong {
@@ -1597,9 +1738,16 @@ def render_panel_header(title: str, badge_text: str, definition: str):
 def load_openai_api_key() -> str:
     try:
         if "OPENAI_API_KEY" in st.secrets:
-            return st.secrets["OPENAI_API_KEY"]
+            return str(st.secrets["OPENAI_API_KEY"]).strip()
+        openai_secrets = st.secrets.get("openai", {})
+        if isinstance(openai_secrets, dict) and openai_secrets.get("api_key"):
+            return str(openai_secrets["api_key"]).strip()
     except Exception:
         pass
+
+    env_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if env_key:
+        return env_key
 
     api_file = Path(__file__).resolve().parent / "API.txt"
     if api_file.exists():
@@ -1613,7 +1761,8 @@ def load_openai_api_key() -> str:
                     return api_key
 
     raise ValueError(
-        "OPENAI_API_KEY not found. Add it in Streamlit secrets or local API.txt."
+        "OPENAI_API_KEY not found. Add it in Streamlit Cloud secrets "
+        "(Settings → Secrets) or local API.txt."
     )
 
 
@@ -1714,8 +1863,7 @@ def empty_agent() -> dict:
         "position": "",
         "temperature": DEFAULT_AGENT_TEMPERATURE,
         "reasoning_style": "",
-        "supporting_urls": "",
-        "supporting_context": [],
+        "tool_urls": "",
     }
 
 
@@ -1733,31 +1881,36 @@ def normalize_agent(agent: dict) -> dict:
         temperature = float(agent.get("temperature", DEFAULT_AGENT_TEMPERATURE))
     except (TypeError, ValueError):
         temperature = DEFAULT_AGENT_TEMPERATURE
+    tool_urls = agent.get("tool_urls") or agent.get("supporting_urls", "")
     return {
         "name": agent.get("name", ""),
         "position": agent.get("position", ""),
         "temperature": temperature,
         "reasoning_style": reasoning_style,
-        "supporting_urls": agent.get("supporting_urls", ""),
-        "supporting_context": list(agent.get("supporting_context", []) or []),
+        "tool_urls": tool_urls,
     }
 
 
-def parse_supporting_urls(raw_urls: str) -> tuple[list[str], str | None]:
+def get_agent_tool_urls(agent: dict) -> list[str]:
+    urls, _ = parse_tool_urls(normalize_agent(agent).get("tool_urls", ""))
+    return urls
+
+
+def parse_tool_urls(raw_urls: str) -> tuple[list[str], str | None]:
     lines = [line.strip() for line in raw_urls.splitlines() if line.strip()]
 
-    if len(lines) > MAX_SUPPORTING_URLS_PER_AGENT:
-        return [], f"Paste at most {MAX_SUPPORTING_URLS_PER_AGENT} URLs."
+    if len(lines) > MAX_TOOL_URLS_PER_AGENT:
+        return [], f"Add at most {MAX_TOOL_URLS_PER_AGENT} tool URLs."
 
     cleaned_urls: list[str] = []
     seen: set[str] = set()
 
     for url in lines:
         if not url.startswith(("http://", "https://")):
-            return [], "Each URL must start with http:// or https://."
+            return [], "Each tool URL must start with http:// or https://."
 
         if not urlparse(url).netloc:
-            return [], "Each URL must be a valid web address."
+            return [], "Each tool URL must be a valid web address."
 
         if url not in seen:
             cleaned_urls.append(url)
@@ -1766,27 +1919,48 @@ def parse_supporting_urls(raw_urls: str) -> tuple[list[str], str | None]:
     return cleaned_urls, None
 
 
-def split_supporting_urls(raw_urls: str | list[str]) -> list[str]:
+def split_tool_urls(raw_urls: str | list[str]) -> list[str]:
     if isinstance(raw_urls, list):
-        slots = [url.strip() for url in raw_urls[:MAX_SUPPORTING_URLS_PER_AGENT]]
+        slots = [url.strip() for url in raw_urls[:MAX_TOOL_URLS_PER_AGENT]]
     else:
         slots = [line.strip() for line in raw_urls.splitlines() if line.strip()][
-            :MAX_SUPPORTING_URLS_PER_AGENT
+            :MAX_TOOL_URLS_PER_AGENT
         ]
 
-    while len(slots) < MAX_SUPPORTING_URLS_PER_AGENT:
+    while len(slots) < MAX_TOOL_URLS_PER_AGENT:
         slots.append("")
 
     return slots
 
 
-def join_supporting_urls(url_slots: list[str]) -> str:
+def join_tool_urls(url_slots: list[str]) -> str:
     return "\n".join(url.strip() for url in url_slots if url.strip())
 
 
 def clean_extracted_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def extract_web_search_excerpt(
+    text: str,
+    max_chars: int = MAX_WEB_SEARCH_EXCERPT_CHARS,
+) -> str:
+    cleaned = clean_extracted_text(text)
+    if not cleaned:
+        return ""
+    if len(cleaned) <= max_chars:
+        return cleaned
+
+    truncated = cleaned[:max_chars]
+    last_sentence_end = max(
+        truncated.rfind("."),
+        truncated.rfind("!"),
+        truncated.rfind("?"),
+    )
+    if last_sentence_end >= max_chars // 2:
+        return truncated[: last_sentence_end + 1].strip()
+    return f"{truncated.rstrip()}…"
 
 
 def truncate_at_sentence_boundary(text: str, min_chars: int = MAX_PROMPT_CONTEXT_CHARS) -> str:
@@ -1799,6 +1973,49 @@ def truncate_at_sentence_boundary(text: str, min_chars: int = MAX_PROMPT_CONTEXT
             return text[: index + 1].strip()
 
     return text[:min_chars].strip()
+
+
+def extract_text_from_html(html_content: str) -> tuple[str | None, str | None]:
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    for tag in soup(["script", "style", "nav", "header", "footer", "aside", "noscript"]):
+        tag.decompose()
+
+    title = None
+    h1 = soup.find("h1")
+    if h1:
+        title = clean_extracted_text(h1.get_text(" ", strip=True))
+
+    if not title and soup.title:
+        title = clean_extracted_text(soup.title.get_text(" ", strip=True))
+
+    candidate_containers: list = []
+    for selector in ("article", "main"):
+        candidate_containers.extend(soup.select(selector))
+
+    if not candidate_containers:
+        candidate_containers = [soup]
+
+    paragraphs: list[str] = []
+    for container in candidate_containers:
+        for paragraph_tag in container.find_all("p"):
+            paragraph = clean_extracted_text(paragraph_tag.get_text(" ", strip=True))
+            if len(paragraph) >= 40:
+                paragraphs.append(paragraph)
+
+    unique_paragraphs: list[str] = []
+    seen: set[str] = set()
+    for paragraph in paragraphs:
+        if paragraph not in seen:
+            unique_paragraphs.append(paragraph)
+            seen.add(paragraph)
+
+    text = clean_extracted_text("\n\n".join(unique_paragraphs))
+    return title, text
+
+
+def blocked_fetch_notice_for_error(exc: Exception | None) -> str:
+    return BLOCKED_FETCH_NOTICE
 
 
 def extract_with_trafilatura(url: str) -> tuple[str | None, str | None]:
@@ -1841,48 +2058,146 @@ def extract_with_bs4(url: str, timeout: int = ARTICLE_REQUEST_TIMEOUT) -> tuple[
 
     response = requests.get(url, headers=headers, timeout=timeout)
     response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    for tag in soup(["script", "style", "nav", "header", "footer", "aside", "noscript"]):
-        tag.decompose()
-
-    title = None
-    h1 = soup.find("h1")
-    if h1:
-        title = clean_extracted_text(h1.get_text(" ", strip=True))
-
-    if not title and soup.title:
-        title = clean_extracted_text(soup.title.get_text(" ", strip=True))
-
-    candidate_containers: list = []
-    for selector in ("article", "main"):
-        candidate_containers.extend(soup.select(selector))
-
-    if not candidate_containers:
-        candidate_containers = [soup]
-
-    paragraphs: list[str] = []
-    for container in candidate_containers:
-        for paragraph_tag in container.find_all("p"):
-            paragraph = clean_extracted_text(paragraph_tag.get_text(" ", strip=True))
-            if len(paragraph) >= 40:
-                paragraphs.append(paragraph)
-
-    unique_paragraphs: list[str] = []
-    seen: set[str] = set()
-    for paragraph in paragraphs:
-        if paragraph not in seen:
-            unique_paragraphs.append(paragraph)
-            seen.add(paragraph)
-
-    text = clean_extracted_text("\n\n".join(unique_paragraphs))
-    return title, text
+    return extract_text_from_html(response.text)
 
 
-def extract_article_text(url: str, timeout: int = ARTICLE_REQUEST_TIMEOUT) -> dict:
+def is_blocked_page_title(title: str | None) -> bool:
+    normalized = (title or "").strip().lower()
+    return normalized in BLOCKED_PAGE_TITLES or any(
+        keyword in normalized for keyword in ("access denied", "forbidden")
+    )
+
+
+def fetch_with_playwright(
+    url: str,
+    timeout_sec: int = PLAYWRIGHT_TIMEOUT_SEC,
+) -> tuple[str | None, str | None, str]:
+    """Headless browser fetch when direct HTTP fails. Optional on Streamlit Cloud."""
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None, None, "Playwright is not installed."
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=PLAYWRIGHT_LAUNCH_ARGS,
+            )
+            try:
+                context = browser.new_context(
+                    user_agent=WEB_FETCH_USER_AGENT,
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    viewport={"width": 1366, "height": 768},
+                    screen={"width": 1920, "height": 1080},
+                    color_scheme="light",
+                    extra_http_headers={
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "DNT": "1",
+                    },
+                )
+                context.add_init_script(PLAYWRIGHT_STEALTH_SCRIPT)
+                page = context.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout_sec * 1000)
+                try:
+                    page.wait_for_load_state(
+                        "networkidle",
+                        timeout=min(timeout_sec * 1000, 15_000),
+                    )
+                except Exception:
+                    pass
+                page.wait_for_timeout(1_500)
+                page.evaluate(
+                    "() => { window.scrollTo(0, document.body.scrollHeight / 2); }"
+                )
+                page.wait_for_timeout(800)
+                html_content = page.content()
+                page_title = page.title()
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        message = str(exc)
+        if "Executable doesn't exist" in message:
+            return None, None, "Playwright Chromium is not installed."
+        return None, None, message
+    except Exception as exc:
+        return None, None, str(exc)
+
+    if is_blocked_page_title(page_title):
+        return page_title, None, "Blocked page received."
+
+    parsed_title, parsed_text = extract_text_from_html(html_content)
+    resolved_title = page_title or parsed_title
+    if is_blocked_page_title(resolved_title):
+        return resolved_title, None, "Blocked page received."
+    if not parsed_text or len(parsed_text) < MIN_EXTRACTED_CHARS:
+        return resolved_title, None, "Too little readable text."
+    return resolved_title, parsed_text, ""
+
+
+def fetch_with_wayback(
+    url: str,
+    timeout_sec: int = WAYBACK_TIMEOUT_SEC,
+) -> tuple[str | None, str | None, str, str]:
+    """Fetch closest Wayback Machine snapshot when live page is blocked."""
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+    api_url = WAYBACK_AVAILABILITY_API.format(
+        url=urllib.parse.quote(url, safe=":/"),
+        ts=timestamp,
+    )
+    try:
+        with urllib.request.urlopen(api_url, timeout=timeout_sec) as response:
+            data = json.loads(response.read())
+        archived = data.get("archived_snapshots", {}).get("closest", {})
+        if not archived.get("available"):
+            return None, None, "", "No archived snapshot is available for this URL."
+        archive_url = archived["url"]
+        page_response = requests.get(
+            archive_url,
+            headers={"User-Agent": WEB_FETCH_USER_AGENT},
+            timeout=timeout_sec,
+        )
+        page_response.raise_for_status()
+        title, text = extract_text_from_html(page_response.text)
+        if not text or len(text) < MIN_EXTRACTED_CHARS:
+            return title, None, archive_url, "Archived page had too little readable text."
+        return title, text, archive_url, ""
+    except Exception as exc:
+        return None, None, "", f"Archive fetch failed: {exc}"
+
+
+def notify_fetch_progress(
+    on_progress: Callable[[dict], None] | None,
+    *,
+    status: str,
+    notice: str,
+    fetch_method: str,
+) -> None:
+    if on_progress:
+        on_progress(
+            {
+                "status": status,
+                "blocked_notice": notice,
+                "fetch_method": fetch_method,
+            }
+        )
+
+
+def extract_article_text(
+    url: str,
+    timeout: int = ARTICLE_REQUEST_TIMEOUT,
+    *,
+    on_progress: Callable[[dict], None] | None = None,
+) -> dict:
     title = None
     text = None
+    blocked_notice = ""
+    fetch_method = "direct"
+    fetch_source_url = ""
+    direct_error: Exception | None = None
+    playwright_error = ""
 
     t_title, t_text = extract_with_trafilatura(url)
     if t_text and len(t_text) >= MIN_EXTRACTED_CHARS:
@@ -1895,25 +2210,63 @@ def extract_article_text(url: str, timeout: int = ARTICLE_REQUEST_TIMEOUT) -> di
             title = title or b_title
             text = b_text
         except Exception as exc:
+            direct_error = exc
+
+    needs_playwright = direct_error is not None or not text or len(text or "") < MIN_EXTRACTED_CHARS
+    if needs_playwright:
+        blocked_notice = blocked_fetch_notice_for_error(direct_error)
+        notify_fetch_progress(
+            on_progress,
+            status="retrying",
+            notice=blocked_notice,
+            fetch_method="playwright",
+        )
+        p_title, p_text, playwright_error = fetch_with_playwright(
+            url,
+            timeout_sec=PLAYWRIGHT_TIMEOUT_SEC,
+        )
+        if p_text and len(p_text) >= MIN_EXTRACTED_CHARS:
+            fetch_method = "playwright"
+            blocked_notice = WEB_SEARCH_RECOVERED_NOTICE
+            title = p_title or title
+            text = p_text
+
+    if not text or len(text) < MIN_EXTRACTED_CHARS:
+        notify_fetch_progress(
+            on_progress,
+            status="retrying",
+            notice=WAYBACK_FETCH_NOTICE,
+            fetch_method="wayback",
+        )
+        w_title, w_text, archive_url, wayback_error = fetch_with_wayback(url)
+        if w_text and len(w_text) >= MIN_EXTRACTED_CHARS:
+            fetch_method = "wayback"
+            blocked_notice = WEB_SEARCH_RECOVERED_NOTICE
+            fetch_source_url = archive_url
+            title = w_title or title
+            text = w_text
+        else:
+            error_parts: list[str] = []
+            if direct_error is not None:
+                error_parts.append("Normal fetch was blocked.")
+            if playwright_error:
+                error_parts.append("Silent crawl could not reach the live page.")
+            if wayback_error:
+                error_parts.append("Could not recover a readable copy of the source.")
+            if not error_parts:
+                error_parts.append(
+                    "Too little readable article text was extracted. Try another article URL."
+                )
             return {
                 "url": url,
                 "title": title or "",
-                "text": "",
+                "text": text or "",
                 "status": "failed",
-                "error": f"Extraction failed: {exc}",
+                "error": " ".join(error_parts),
+                "blocked_notice": blocked_notice or BLOCKED_FETCH_NOTICE,
+                "fetch_method": fetch_method if fetch_method != "direct" else "wayback",
+                "fetch_source_url": archive_url or "",
             }
-
-    if not text or len(text) < MIN_EXTRACTED_CHARS:
-        return {
-            "url": url,
-            "title": title or "",
-            "text": text or "",
-            "status": "failed",
-            "error": (
-                "Too little readable article text was extracted. "
-                "Try another article URL."
-            ),
-        }
 
     return {
         "url": url,
@@ -1921,44 +2274,408 @@ def extract_article_text(url: str, timeout: int = ARTICLE_REQUEST_TIMEOUT) -> di
         "text": text[:MAX_CHARS_PER_ARTICLE],
         "status": "success",
         "error": "",
+        "blocked_notice": blocked_notice,
+        "fetch_method": fetch_method,
+        "fetch_source_url": fetch_source_url,
     }
 
 
-def count_successful_supporting_sources(agent: dict) -> int:
-    return sum(
-        1
-        for item in agent.get("supporting_context", [])
-        if item.get("status") == "success"
+def tool_urls_summary_label(agent: dict) -> str:
+    count = len(get_agent_tool_urls(agent))
+    if count == 0:
+        return "None"
+    return f"web_search ({count} URL{'s' if count != 1 else ''})"
+
+
+def format_tool_urls_for_prompt(tool_urls: list[str]) -> str:
+    if not tool_urls:
+        return "No tools are configured for this agent."
+
+    lines = [
+        "Tool — web_search",
+        "Description — Fetches readable article text from one of this agent's registered URLs.",
+        "Registered URLs (up to 3) —",
+    ]
+    for index, url in enumerate(tool_urls, start=1):
+        lines.append(f"  {index}. {url}")
+    return "\n".join(lines)
+
+
+def build_web_search_tool_definition(tool_urls: list[str]) -> list[dict]:
+    if not tool_urls:
+        return []
+
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": WEB_SEARCH_TOOL_NAME,
+                "description": (
+                    "Search one of this agent's registered article URLs and return readable "
+                    "text. Call only when you need concrete evidence, facts, statistics, "
+                    "or examples to support your argument in this turn."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": (
+                                "One of the URLs registered under this agent's web_search tool."
+                            ),
+                            "enum": tool_urls,
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": (
+                                "Brief note on what evidence you hope to find in this source."
+                            ),
+                        },
+                    },
+                    "required": ["url"],
+                },
+            },
+        }
+    ]
+
+
+def build_web_search_fetch_entry(
+    requested_url: str,
+    reason: str,
+    extracted: dict,
+) -> dict:
+    entry = {
+        "url": requested_url,
+        "reason": reason,
+        "status": extracted.get("status", "failed"),
+        "title": extracted.get("title", ""),
+        "excerpt": "",
+        "error": "",
+        "blocked_notice": extracted.get("blocked_notice", ""),
+        "fetch_method": extracted.get("fetch_method", "direct"),
+        "fetch_source_url": extracted.get("fetch_source_url", ""),
+    }
+    if entry["status"] == "success":
+        entry["excerpt"] = extract_web_search_excerpt(extracted.get("text") or "")
+    elif entry["status"] != "retrying":
+        entry["error"] = extracted.get("error") or "Extraction failed."
+    return entry
+
+
+def render_web_search_entry_body(entry: dict, *, call_index: int) -> str:
+    reason = html.escape(entry.get("reason") or "Fetching evidence for this argument.")
+    url = entry.get("url", "")
+    safe_url = html.escape(url, quote=True)
+    status = entry.get("status", "failed")
+    blocked_notice = entry.get("blocked_notice", "")
+    blocked_html = ""
+    if blocked_notice:
+        blocked_html = (
+            f'<div class="debate-web-search-blocked">{html.escape(blocked_notice)}</div>'
+        )
+
+    if status == "retrying":
+        return (
+            f'<div class="debate-web-search-call debate-web-search-call--retrying">'
+            f'<div class="debate-web-search-label">web_search · Call {call_index}</div>'
+            f'<div class="debate-web-search-reason">{reason}</div>'
+            f'<div class="debate-web-search-url">'
+            f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer">{html.escape(url)}</a>'
+            f"</div>"
+            f"{blocked_html}"
+            f"</div>"
+        )
+
+    if status == "success":
+        title = html.escape(entry.get("title") or "Untitled article")
+        excerpt = html.escape(entry.get("excerpt") or "")
+        return (
+            f'<div class="debate-web-search-call">'
+            f'<div class="debate-web-search-label">web_search · Call {call_index}</div>'
+            f'<div class="debate-web-search-reason">{reason}</div>'
+            f'<div class="debate-web-search-url">'
+            f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer">{html.escape(url)}</a>'
+            f"</div>"
+            f"{blocked_html}"
+            f'<div class="debate-web-search-title">{title}</div>'
+            f'<blockquote class="debate-web-search-excerpt">"{excerpt}"</blockquote>'
+            f"</div>"
+        )
+
+    error = html.escape(entry.get("error") or "Fetch failed.")
+    return (
+        f'<div class="debate-web-search-call debate-web-search-call--failed">'
+        f'<div class="debate-web-search-label">web_search · Call {call_index}</div>'
+        f'<div class="debate-web-search-reason">{reason}</div>'
+        f'<div class="debate-web-search-url">'
+        f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer">{html.escape(url)}</a>'
+        f"</div>"
+        f"{blocked_html}"
+        f'<div class="debate-web-search-title">Error{LABEL_DASH} {error}</div>'
+        f"</div>"
     )
 
 
-def supporting_context_summary_label(agent: dict) -> str:
-    count = count_successful_supporting_sources(agent)
-    if count == 0:
-        return "None"
-    return f"{count} source{'s' if count != 1 else ''}"
-
-
-def format_supporting_context_for_prompt(context_items: list[dict] | None) -> str:
-    if not context_items:
-        return "No supporting context was provided for this agent."
-
-    successful = [item for item in context_items if item.get("status") == "success"]
-    if not successful:
-        return "No supporting context was provided for this agent."
+def format_web_search_calls_text(web_searches: list[dict]) -> str:
+    if not web_searches:
+        return ""
 
     blocks: list[str] = []
-    for item in successful:
-        title = item.get("title") or "Untitled article"
-        url = item.get("url", "")
-        text = truncate_at_sentence_boundary(item.get("text") or "")
-        blocks.append(
-            f"Title{LABEL_DASH} {title}\n"
-            f"URL{LABEL_DASH} {url}\n"
-            f"Text{LABEL_DASH}\n{text}"
+    for index, entry in enumerate(web_searches, start=1):
+        reason = entry.get("reason") or "Fetching evidence for this argument."
+        url = entry.get("url", "")
+        blocked_notice = entry.get("blocked_notice", "")
+        notice_lines = [f"[web_search call {index}] {reason}", f"URL{LABEL_DASH} {url}"]
+        if blocked_notice:
+            notice_lines.append(f"Notice{LABEL_DASH} {blocked_notice}")
+        if entry.get("status") == "retrying":
+            blocks.append("\n".join(notice_lines))
+            continue
+        if entry.get("status") == "success":
+            title = entry.get("title") or "Untitled article"
+            excerpt = entry.get("excerpt") or ""
+            notice_lines.extend(
+                [
+                    f"Title{LABEL_DASH} {title}",
+                    f'Excerpt{LABEL_DASH} "{excerpt}"',
+                ]
+            )
+        else:
+            error = entry.get("error") or "Fetch failed."
+            notice_lines.append(f"Error{LABEL_DASH} {error}")
+        blocks.append("\n".join(notice_lines))
+    return "\n\n".join(blocks)
+
+
+def render_web_search_calls_html(web_searches: list[dict]) -> str:
+    if not web_searches:
+        return ""
+
+    items = [
+        render_web_search_entry_body(entry, call_index=index)
+        for index, entry in enumerate(web_searches, start=1)
+    ]
+    return f'<div class="debate-web-search-calls">{"".join(items)}</div>'
+
+
+def format_web_search_tool_result(extracted: dict) -> str:
+    if extracted.get("status") != "success":
+        lines = [
+            f"Failed to fetch article{LABEL_DASH} {extracted.get('url', '')}",
+            f"Error{LABEL_DASH} {extracted.get('error') or 'Extraction failed.'}",
+        ]
+        if extracted.get("blocked_notice"):
+            lines.insert(1, f"Notice{LABEL_DASH} {extracted['blocked_notice']}")
+        return "\n".join(lines)
+
+    title = extracted.get("title") or "Untitled article"
+    url = extracted.get("url", "")
+    text = truncate_at_sentence_boundary(extracted.get("text") or "")
+    lines = [f"Title{LABEL_DASH} {title}", f"URL{LABEL_DASH} {url}"]
+    if extracted.get("blocked_notice"):
+        lines.append(f"Notice{LABEL_DASH} {extracted['blocked_notice']}")
+    lines.append(f"Text{LABEL_DASH}\n{text}")
+    return "\n".join(lines)
+
+
+def run_web_search_tool(
+    url: str,
+    allowed_urls: list[str],
+    *,
+    on_progress: Callable[[dict], None] | None = None,
+) -> dict:
+    if url not in allowed_urls:
+        return {
+            "url": url,
+            "title": "",
+            "text": "",
+            "status": "failed",
+            "error": "That URL is not registered under this agent's web_search tool.",
+            "blocked_notice": "",
+            "fetch_method": "direct",
+            "fetch_source_url": "",
+        }
+    return extract_article_text(url, on_progress=on_progress)
+
+
+def append_assistant_tool_message(messages: list[dict], message) -> None:
+    tool_calls = []
+    for tool_call in message.tool_calls or []:
+        tool_calls.append(
+            {
+                "id": tool_call.id,
+                "type": "function",
+                "function": {
+                    "name": tool_call.function.name,
+                    "arguments": tool_call.function.arguments,
+                },
+            }
         )
 
-    return "\n\n".join(blocks)
+    messages.append(
+        {
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": tool_calls,
+        }
+    )
+
+
+def resolve_agent_turn_messages(
+    user_prompt: str,
+    tool_urls: list[str],
+    *,
+    max_new_tokens: int,
+    temperature: float,
+    max_tool_rounds: int = MAX_TOOL_CALLS_PER_TURN,
+    on_web_search_progress: Callable[[list[dict]], None] | None = None,
+) -> tuple[list[dict], list[dict], str | None]:
+    """
+    Run the tool-calling loop for one debate turn.
+    Returns (messages, fetch_log, immediate_content).
+  immediate_content is set when the model already returned final text.
+    """
+    messages: list[dict] = [
+        {"role": "system", "content": DEBATE_AGENT_SYSTEM},
+        {"role": "user", "content": user_prompt},
+    ]
+    tools = build_web_search_tool_definition(tool_urls)
+    fetch_log: list[dict] = []
+
+    for round_index in range(max_tool_rounds + 1):
+        kwargs: dict = {
+            "model": MODEL_ID,
+            "messages": messages,
+            "max_tokens": max_new_tokens,
+            "temperature": temperature if temperature > 0 else 0,
+        }
+        if tools and round_index < max_tool_rounds:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+
+        response = get_client().chat.completions.create(**kwargs)
+        message = response.choices[0].message
+
+        if message.tool_calls:
+            append_assistant_tool_message(messages, message)
+            for tool_call in message.tool_calls:
+                if tool_call.function.name != WEB_SEARCH_TOOL_NAME:
+                    continue
+
+                try:
+                    arguments = json.loads(tool_call.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+
+                requested_url = str(arguments.get("url", "")).strip()
+                reason = str(arguments.get("reason", "")).strip()
+
+                def notify_fetch_progress(progress: dict) -> None:
+                    if not on_web_search_progress:
+                        return
+                    on_web_search_progress(
+                        fetch_log
+                        + [
+                            build_web_search_fetch_entry(
+                                requested_url,
+                                reason,
+                                progress,
+                            )
+                        ]
+                    )
+
+                extracted = run_web_search_tool(
+                    requested_url,
+                    tool_urls,
+                    on_progress=notify_fetch_progress,
+                )
+                fetch_log.append(
+                    build_web_search_fetch_entry(
+                        requested_url,
+                        reason,
+                        extracted,
+                    )
+                )
+                if on_web_search_progress:
+                    on_web_search_progress(fetch_log)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": format_web_search_tool_result(extracted),
+                    }
+                )
+            continue
+
+        content = (message.content or "").strip()
+        if content:
+            return messages, fetch_log, content
+
+    return messages, fetch_log, None
+
+
+def generate_agent_turn(
+    user_prompt: str,
+    tool_urls: list[str],
+    *,
+    max_new_tokens: int = 320,
+    temperature: float = DEFAULT_AGENT_TEMPERATURE,
+) -> tuple[str, list[dict]]:
+    messages, fetch_log, immediate_content = resolve_agent_turn_messages(
+        user_prompt,
+        tool_urls,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+    )
+    if immediate_content is not None:
+        return immediate_content, fetch_log
+
+    response = get_client().chat.completions.create(
+        model=MODEL_ID,
+        messages=messages,
+        max_tokens=max_new_tokens,
+        temperature=temperature if temperature > 0 else 0,
+    )
+    return (response.choices[0].message.content or "").strip(), fetch_log
+
+
+def stream_agent_turn(
+    user_prompt: str,
+    tool_urls: list[str],
+    *,
+    max_new_tokens: int = 320,
+    temperature: float = DEFAULT_AGENT_TEMPERATURE,
+    on_web_search_progress: Callable[[list[dict]], None] | None = None,
+) -> tuple[list[dict], Iterator[str]]:
+    messages, fetch_log, immediate_content = resolve_agent_turn_messages(
+        user_prompt,
+        tool_urls,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        on_web_search_progress=on_web_search_progress,
+    )
+
+    if immediate_content is not None:
+        def immediate_tokens() -> Iterator[str]:
+            yield from immediate_content
+
+        return fetch_log, immediate_tokens()
+
+    stream = get_client().chat.completions.create(
+        model=MODEL_ID,
+        messages=messages,
+        max_tokens=max_new_tokens,
+        temperature=temperature if temperature > 0 else 0,
+        stream=True,
+    )
+
+    def token_stream() -> Iterator[str]:
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+
+    return fetch_log, token_stream()
 
 
 def temperature_band(value: float) -> str:
@@ -2077,6 +2794,9 @@ def format_structured_debate_transcript(
     for round_data in rounds_data:
         round_number = round_data["number"]
         for turn in round_data.get("turns", []):
+            web_search_text = format_web_search_calls_text(turn.get("web_searches") or [])
+            if web_search_text:
+                lines.append(web_search_text)
             lines.append(
                 format_structured_turn_line(
                     round_number,
@@ -2103,7 +2823,9 @@ def build_agent_turn_generation_section(
     if round_spec["mode"] == "opening":
         round_task = (
             f"Present your opening argument clearly from your position. "
-            "State what you believe and why it matters relative to the core theme."
+            "State what you believe and why it matters relative to the core theme. "
+            "If an earlier speaker in this round repeats a point without adding substance, "
+            f"call it out by name and state that they first raised it in Round {round_number}."
         )
     else:
         round_task = (
@@ -2112,8 +2834,8 @@ def build_agent_turn_generation_section(
             "critique where you can. If another agent misunderstood or misrepresented your "
             "position, call that out clearly and restate your point — but do not recycle the "
             "same argument without responding to what was said. "
-            "If another agent restates a claim from their history without adding substance, "
-            "call it out by name and cite the round it first appeared in."
+            "If another agent repeats a claim without adding substance, call it out by name "
+            "and state the round number where they first raised that same point."
         )
 
     return f"""Reasoning style for this turn{LABEL_DASH} {reasoning_style}
@@ -2127,7 +2849,7 @@ Round task (Round {round_number} — {round_spec["title"]}){LABEL_DASH}
 {round_spec["description"]}
 {round_task}
 Stay aligned with your position and the core theme.
-Keep it sharp and discussion-friendly in 2-4 sentences.
+Keep it sharp and discussion-friendly in 2-5 sentences.
 
 Output rules{LABEL_DASH}
 - Follow your reasoning style while obeying the debate rules.
@@ -2135,6 +2857,8 @@ Output rules{LABEL_DASH}
 - Do NOT use markdown headers.
 - Do NOT give a verdict or final answer.
 - When referring to another participant by name, wrap their exact name in double asterisks (e.g. {other_names_for_bold}). Do not bold your own name.
+- If you used web_search in this turn, you MUST cite the source URL you fetched and include a short verbatim excerpt from the returned text that supports your point (use quotation marks for the excerpt).
+- If you call out an opponent for repeating a point, you MUST name the round number where they first made that point (e.g. "Round 1").
 - Return ONLY the argument text that would appear after this prefix{LABEL_DASH}
 {line_prefix.strip()}"""
 
@@ -2147,7 +2871,6 @@ def build_agent_turn_prompt(
     agent_index: int,
     general_debate_rules: str,
     rounds_data: list[dict],
-    agent_supporting_context: list[dict] | None = None,
 ) -> str:
     other_agents = [item for index, item in enumerate(selected_agents) if index != agent_index]
     other_agent_names = [participant["name"] for participant in other_agents]
@@ -2163,7 +2886,8 @@ def build_agent_turn_prompt(
     scenario_name = scenario["scenario_name"]
     position = normalized["position"]
     core_theme = scenario["scenario_core_question"]
-    supporting_context_block = format_supporting_context_for_prompt(agent_supporting_context)
+    tool_urls = get_agent_tool_urls(agent)
+    tools_block = format_tool_urls_for_prompt(tool_urls)
     debate_transcript = format_structured_debate_transcript(rounds_data, agent_name)
     generation_section = build_agent_turn_generation_section(
         agent,
@@ -2184,34 +2908,38 @@ def build_agent_turn_prompt(
             f"plus earlier speakers in round {round_number}"
         )
 
+    tool_rules = (
+        "Tools for this speaking agent —\n"
+        f"{tools_block}\n\n"
+        "Tool rules —\n"
+        "- Article text is NOT pre-loaded. Call web_search only when you need evidence from a registered URL.\n"
+        "- web_search accepts one URL at a time from the registered list above.\n"
+        "- After fetching, use the returned text to strengthen your argument or counter opposing claims.\n"
+        "- In your spoken turn, cite the URL you fetched and quote a short excerpt from the returned text.\n"
+        "- Do not invent facts beyond your position, the scenario, debate history, and web_search results.\n"
+        "- If no tools are configured, rely on your position, the scenario, and the debate history only."
+    )
+
     return f"""
 You are simulating one turn in a stakeholder debate for a business-school classroom exercise.
 
 Your name is {agent_name}. You are debating in the scenario {scenario_name}. Your position is {position}. You are in round {round_number}.
 
-Supporting context for this speaking agent{LABEL_DASH}
-{supporting_context_block}
+{tool_rules}
 
-Rules for supporting context{LABEL_DASH}
-- You must consider BOTH the debate history above AND the supporting context below when forming this turn.
-- If supporting context is provided, draw out the strongest arguments, facts, and examples from it that support your position.
-- Use supporting context to strengthen your points and to counter opposing claims made in the debate.
-- Do not invent facts beyond what appears in the supporting context, your position, the scenario, and the debate history.
-- If no supporting context is provided, rely on your position, the scenario, and the debate history only.
-
-The debate so far ({debate_scope}){LABEL_DASH}
+The debate so far ({debate_scope}) —
 Lines marked [YOU] are your own prior statements. Review them before speaking and do not repeat them without responding to what others have said.
 
 {debate_transcript}
 
-Given the above setting and your position, stay aligned with the core theme of this debate{LABEL_DASH}
+Given the above setting and your position, stay aligned with the core theme of this debate —
 {core_theme}
 
 The rules of the debate are:
 
 To be a good debater:
 - Do not repeat your points.
-- Call out when any other agent is repeating points from their history.
+- When calling out repeated points from an opponent, name the round number where they first raised that point.
 
 Now generate your turn accordingly.
 
@@ -2231,6 +2959,9 @@ def build_scenario_analysis_markdown(rounds_data: list[dict]) -> str:
             ]
         )
         for turn in round_data["turns"]:
+            web_search_text = format_web_search_calls_text(turn.get("web_searches") or [])
+            if web_search_text:
+                lines.extend([web_search_text, ""])
             lines.append(f"{turn['agent']}{LABEL_DASH} {turn['text']}")
             lines.append("")
     return "\n".join(lines).strip()
@@ -2292,17 +3023,24 @@ def render_debate_turn_html(
     status: str,
     *,
     partial: bool = False,
+    web_searches: list[dict] | None = None,
 ) -> str:
+    web_search_html = render_web_search_calls_html(web_searches or [])
+
     if status == "waiting":
         body = '<div class="debate-turn-text debate-turn-placeholder">Waiting to present...</div>'
     elif partial or not text.strip():
-        body = (
+        argument_html = (
             f'<div class="debate-turn-text debate-turn-partial">{format_debate_inline_text(text)}</div>'
             if text
             else '<div class="debate-turn-text debate-turn-placeholder">Preparing response...</div>'
         )
+        body = f"{web_search_html}{argument_html}"
     else:
-        body = f'<div class="debate-turn-text">{format_debate_inline_text(text)}</div>'
+        body = (
+            f"{web_search_html}"
+            f'<div class="debate-turn-text">{format_debate_inline_text(text)}</div>'
+        )
 
     status_label = {"waiting": "Waiting", "writing": "Writing", "present": "Present"}[status]
     turn_class = f"debate-turn debate-turn--agent-{agent_index + 1} debate-turn--{status}"
@@ -2344,6 +3082,7 @@ def render_debate_rounds_html(
                             index,
                             turn["text"],
                             "present",
+                            web_searches=turn.get("web_searches"),
                         )
                     )
                 elif name == active_agent:
@@ -2354,6 +3093,7 @@ def render_debate_rounds_html(
                             partial_text,
                             "writing",
                             partial=True,
+                            web_searches=live_state.get("web_searches"),
                         )
                     )
                 else:
@@ -2369,6 +3109,7 @@ def render_debate_rounds_html(
                         agent_index,
                         turn["text"],
                         "present",
+                        web_searches=turn.get("web_searches"),
                     )
                 )
 
@@ -2445,7 +3186,6 @@ def stream_scenario_analysis(
                 unsafe_allow_html=True,
             )
 
-            agent_supporting_context = agent.get("supporting_context", [])
             prompt = build_agent_turn_prompt(
                 scenario,
                 selected_agents,
@@ -2454,16 +3194,54 @@ def stream_scenario_analysis(
                 agent_index,
                 general_debate_rules,
                 rounds_data,
-                agent_supporting_context=agent_supporting_context,
             )
 
             agent_temperature = float(agent.get("temperature", DEFAULT_AGENT_TEMPERATURE))
+            tool_urls = get_agent_tool_urls(agent)
             partial = ""
-            for token in stream_chat_completion(
+            live_fetch_log: list[dict] = []
+
+            def show_live_web_search_progress(fetch_entries: list[dict]) -> None:
+                live_fetch_log.clear()
+                live_fetch_log.extend(fetch_entries)
+                output_area.markdown(
+                    render_debate_rounds_html(
+                        rounds_data,
+                        selected_agents,
+                        {
+                            "round_number": round_number,
+                            "active_agent": agent_name,
+                            "partial_text": partial,
+                            "completed_in_round": completed_in_round,
+                            "web_searches": live_fetch_log,
+                        },
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+            fetch_log, token_stream = stream_agent_turn(
                 prompt,
-                max_new_tokens=260,
+                tool_urls,
+                max_new_tokens=320,
                 temperature=agent_temperature,
-            ):
+                on_web_search_progress=show_live_web_search_progress,
+            )
+            if fetch_log:
+                output_area.markdown(
+                    render_debate_rounds_html(
+                        rounds_data,
+                        selected_agents,
+                        {
+                            "round_number": round_number,
+                            "active_agent": agent_name,
+                            "partial_text": "",
+                            "completed_in_round": completed_in_round,
+                            "web_searches": fetch_log,
+                        },
+                    ),
+                    unsafe_allow_html=True,
+                )
+            for token in token_stream:
                 partial += token
                 time.sleep(len(token) * STREAM_CHAR_DELAY_SEC)
                 status_area.markdown(
@@ -2483,13 +3261,20 @@ def stream_scenario_analysis(
                             "active_agent": agent_name,
                             "partial_text": partial,
                             "completed_in_round": completed_in_round,
+                            "web_searches": fetch_log,
                         },
                     ),
                     unsafe_allow_html=True,
                 )
 
             turn_text = partial.strip()
-            round_entry["turns"].append({"agent": agent_name, "text": turn_text})
+            round_entry["turns"].append(
+                {
+                    "agent": agent_name,
+                    "text": turn_text,
+                    "web_searches": fetch_log,
+                }
+            )
 
             completed_in_round = [turn["agent"] for turn in round_entry["turns"]]
             status_area.markdown(
@@ -2533,7 +3318,6 @@ def run_scenario_analysis(
         rounds_data.append(round_entry)
 
         for agent_index, agent in enumerate(selected_agents):
-            agent_supporting_context = agent.get("supporting_context", [])
             prompt = build_agent_turn_prompt(
                 scenario,
                 selected_agents,
@@ -2542,12 +3326,23 @@ def run_scenario_analysis(
                 agent_index,
                 general_debate_rules,
                 rounds_data,
-                agent_supporting_context=agent_supporting_context,
             )
             agent_temperature = float(agent.get("temperature", DEFAULT_AGENT_TEMPERATURE))
-            argument = ask_model(prompt, max_new_tokens=260, temperature=agent_temperature)
+            tool_urls = get_agent_tool_urls(agent)
+            argument, fetch_log = generate_agent_turn(
+                prompt,
+                tool_urls,
+                max_new_tokens=320,
+                temperature=agent_temperature,
+            )
             turn_text = argument.strip()
-            round_entry["turns"].append({"agent": agent["name"], "text": turn_text})
+            round_entry["turns"].append(
+                {
+                    "agent": agent["name"],
+                    "text": turn_text,
+                    "web_searches": fetch_log,
+                }
+            )
 
     return build_scenario_analysis_markdown(rounds_data), rounds_data
 
@@ -2834,28 +3629,10 @@ Temperature{LABEL_DASH} {normalized["temperature"]}
 Reasoning Style{LABEL_DASH} {style}
 Reasoning Style Meaning{LABEL_DASH} {REASONING_STYLE_DEFINITIONS[style]}
 Reasoning Style Behavior{LABEL_DASH} {REASONING_STYLE_BEHAVIORS[style]}
-Supporting URLs{LABEL_DASH}
-{normalized["supporting_urls"].strip() or "None"}"""
+Tools{LABEL_DASH} web_search
+Registered URLs{LABEL_DASH}
+{normalized["tool_urls"].strip() or "None"}"""
         )
-
-        context_items = normalized.get("supporting_context", [])
-        if context_items:
-            blocks.append(f"Extracted Context{LABEL_DASH}")
-            for item in context_items:
-                if item.get("status") == "success":
-                    text = item.get("text") or ""
-                    preview = text if len(text) <= 2500 else text[:2500] + "..."
-                    blocks.append(
-                        f"- {item.get('title') or 'Untitled article'} ({item.get('url', '')})\n"
-                        f"{preview}"
-                    )
-                else:
-                    blocks.append(
-                        f"- Failed{LABEL_DASH} {item.get('url', '')} "
-                        f"({item.get('error') or 'Extraction failed'})"
-                    )
-        else:
-            blocks.append(f"Extracted Context{LABEL_DASH} None")
 
     return "\n\n".join(blocks)
 
@@ -3163,26 +3940,14 @@ def require_agents() -> bool:
     return True
 
 
-def render_supporting_context_expanders(supporting_context: list[dict]):
-    if not supporting_context:
+def render_tool_urls_summary(tool_urls: str):
+    urls, _ = parse_tool_urls(tool_urls)
+    if not urls:
         return
 
-    st.markdown("**Extracted Context**")
-    for item in supporting_context:
-        if item.get("status") == "success":
-            expander_title = item.get("title") or "Untitled article"
-        else:
-            expander_title = f"Failed — {item.get('url', 'Unknown URL')}"
-
-        with st.expander(expander_title):
-            st.caption(item.get("url", ""))
-            st.markdown(f"**Status{LABEL_DASH}** {item.get('status', 'unknown')}")
-            if item.get("status") == "failed":
-                st.write(item.get("error") or "Extraction failed.")
-            else:
-                text = item.get("text") or ""
-                st.markdown(f"**Characters extracted{LABEL_DASH}** {len(text)}")
-                st.write(text[:2500])
+    st.markdown("**web_search** — registered URLs")
+    for index, url in enumerate(urls, start=1):
+        st.caption(f"URL {index}{LABEL_DASH} {url}")
 
 
 def render_agents_table(
@@ -3200,7 +3965,7 @@ def render_agents_table(
             f"<td>{html.escape(normalized['position'])}</td>"
             f"<td>{normalized['temperature']:.2f}</td>"
             f"<td>{html.escape(normalized['reasoning_style'])}</td>"
-            f"<td>{html.escape(supporting_context_summary_label(normalized))}</td>"
+            f"<td>{html.escape(tool_urls_summary_label(normalized))}</td>"
             "</tr>"
         )
 
@@ -3214,7 +3979,7 @@ def render_agents_table(
                 <th>{html.escape(position_header)}</th>
                 <th>Temperature</th>
                 <th>Reasoning Style</th>
-                <th>Supporting Context</th>
+                <th>Tools</th>
               </tr>
             </thead>
             <tbody>
@@ -3265,12 +4030,12 @@ def render_custom_agents_summary(agents: list[dict]):
             f"**Settings{LABEL_DASH}** Temperature {normalized['temperature']:.2f}, "
             f"Reasoning Style {normalized['reasoning_style']}"
         )
-        count = count_successful_supporting_sources(normalized)
-        if count == 0:
-            context_summary = "None"
+        tool_count = len(get_agent_tool_urls(normalized))
+        if tool_count == 0:
+            tools_summary = "None"
         else:
-            context_summary = f"{count} extracted source{'s' if count != 1 else ''}"
-        st.markdown(f"**Supporting context{LABEL_DASH}** {context_summary}")
+            tools_summary = f"web_search ({tool_count} URL{'s' if tool_count != 1 else ''})"
+        st.markdown(f"**Tools{LABEL_DASH}** {tools_summary}")
 
 
 def render_setup_step(step_number: int):
@@ -3518,68 +4283,34 @@ def render_agent_design_step(step_number: int):
             if reasoning_style:
                 st.session_state.agent_draft[index]["reasoning_style"] = reasoning_style
 
-            render_field_label("Supporting article URLs")
-            st.caption("(Up to 3)")
-            st.caption(
-                "Choose strong articles that support this agent's side or point of view. "
-                "The app only extracts readable text and uses it as context for this agent."
-            )
+            render_field_label("Tools")
+            with st.container(border=True):
+                st.markdown("**web_search**")
+                st.caption(
+                    f"One search tool for this agent. Register up to {MAX_TOOL_URLS_PER_AGENT} "
+                    "article URLs it can fetch from during the debate. The agent calls "
+                    "web_search only when it needs evidence — nothing is loaded upfront."
+                )
 
-            url_slots = split_supporting_urls(agent.get("supporting_urls", ""))
-            updated_slots: list[str] = []
-            for slot_index in range(MAX_SUPPORTING_URLS_PER_AGENT):
-                with st.container(border=True):
-                    st.markdown(f"**URL {slot_index + 1}**")
+                url_slots = split_tool_urls(
+                    agent.get("tool_urls") or agent.get("supporting_urls", "")
+                )
+                updated_slots: list[str] = []
+                for slot_index in range(MAX_TOOL_URLS_PER_AGENT):
                     updated_slots.append(
                         st.text_input(
-                            f"Supporting article URL {slot_index + 1}",
+                            f"Registered URL {slot_index + 1}",
                             value=url_slots[slot_index],
                             placeholder="https://example.com/article",
-                            key=f"agent_supporting_url_{index}_{slot_index}",
+                            key=f"agent_tool_url_{index}_{slot_index}",
                             label_visibility="collapsed",
                         )
                     )
 
-            st.session_state.agent_draft[index]["supporting_urls"] = join_supporting_urls(
-                updated_slots
-            )
+                st.session_state.agent_draft[index]["tool_urls"] = join_tool_urls(updated_slots)
 
-            if st.button(
-                "Extract text for this agent",
-                key=f"extract_supporting_{index}",
-                use_container_width=True,
-            ):
-                raw_urls = st.session_state.agent_draft[index].get("supporting_urls", "")
-                urls, parse_error = parse_supporting_urls(raw_urls)
-                if parse_error:
-                    st.warning(parse_error)
-                elif not urls:
-                    st.warning("Enter at least one URL before extracting.")
-                else:
-                    with st.spinner("Extracting article text..."):
-                        extracted: list[dict] = []
-                        for url in urls:
-                            extracted.append(extract_article_text(url))
-                        st.session_state.agent_draft[index]["supporting_context"] = extracted
-
-                    success_count = sum(
-                        1 for item in extracted if item.get("status") == "success"
-                    )
-                    if success_count == len(extracted):
-                        st.success(
-                            f"Extracted text from {success_count} "
-                            f"source{'s' if success_count != 1 else ''}."
-                        )
-                    elif success_count > 0:
-                        st.warning(
-                            f"Extracted text from {success_count} of {len(extracted)} sources. "
-                            "Check failed URLs below."
-                        )
-                    else:
-                        st.error("No readable text could be extracted from the pasted URLs.")
-
-            render_supporting_context_expanders(
-                st.session_state.agent_draft[index].get("supporting_context", [])
+            render_tool_urls_summary(
+                st.session_state.agent_draft[index].get("tool_urls", "")
             )
 
     complete_agents = get_complete_agents(st.session_state.agent_draft)
